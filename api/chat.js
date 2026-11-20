@@ -154,6 +154,58 @@ function checkRateLimit(identity) {
   return { ok: true };
 }
 
+// ══════════ 系统提示词构建（行程数据来自前端传入的 tripContext） ══════════
+// 数据源唯一：data/trips.json → 前端载入 → 聊天时经 tripContext 传到后端。
+// 后端不再硬编码任何行程信息；改数据只需改 data/trips.json 一个文件。
+function buildTripBrief(t){
+  if(!t || typeof t !== 'object') return '';
+  const lines = [];
+  if(t.name) lines.push(`- 行程名称：${t.name}`);
+  if(t.start && t.end) lines.push(`- 时间：${t.start} → ${t.end}`);
+  if(t.fromCity || t.toCity){
+    lines.push(`- 出发地：${t.fromCity||''}${t.fromSub||''}，目的地：${t.toCity||''}${t.toSub||''}`);
+  }
+  const fg = t.flightGo || {}, fr = t.flightRet || {};
+  if(fg.no || fr.no){
+    const seg = (f)=> `${f.no||''}${f.time?('（'+f.time+'）'):''}${f.info?('，'+f.info):''}`;
+    lines.push(`- 往返航班：去程${seg(fg)}；返程${seg(fr)}`);
+  }
+  if(t.budget) lines.push(`- 总预算：${(t.budget/10000).toFixed(0)}万元`);
+  if(Array.isArray(t.localPts) && t.localPts.length){
+    lines.push(`- 住宿安排：${t.localPts.map(p=>`${p.label}${p.days?('（'+p.days+'）'):''}`).join(' → ')}`);
+  }
+  if(t.desc) lines.push(`- 一句话简介：${t.desc}`);
+  return lines.join('\n');
+}
+
+function buildSystemPrompt(tripContext){
+  const ctx = tripContext || {};
+  const brief = buildTripBrief(ctx.currentTrip);
+  const day = ctx.currentDay;
+  const dayLine = (day && day.title) ? `\n【用户当前正在查看】${day.day||''} ${day.date||''} · ${day.title}` : '';
+  const tripBlock = brief
+    ? `【当前行程基本信息】\n${brief}${dayLine}`
+    : `【当前行程基本信息】\n未收到行程数据。请提示用户刷新页面后重试，不要凭空编造行程安排。`;
+
+  return `你是L.L的专属AI行程管家，专门负责私人度假行程的问答与调整。
+
+${tripBlock}
+
+【你的能力】
+1. 回答关于行程的任何问题：第几天去哪、住什么酒店、吃什么餐厅、交通安排、预算构成等
+2. 给出调整建议：根据用户需求推荐餐厅、景点、时间安排的优化
+3. 风格友好、贴心、简洁，符合私人管家的定位
+4. 所有回答严格基于上面提供的行程数据，不要编造不存在的安排
+5. 如果用户提出修改需求，先给出修改预览方案，确认后再实际生效（当前阶段为只读问答，暂不直接修改数据）
+
+【注意事项】
+- 三亚冬季白天24-28℃，夜间19-22℃，紫外线强，提醒防晒
+- 行程以慢节奏、松弛感为主，不赶景点，每天只安排1-2个主要活动
+- 傍晚16:00后再出门活动，避开正午日晒
+- 酒店选择优先安静、私密度假体验
+- 当前为只读问答模式，修改行程的功能将在后续版本上线，你可以先给出修改建议供参考`;
+}
+
 function jsonError(message, status, extraHeaders = {}) {
   return new Response(JSON.stringify({ error: message }), {
     status,
@@ -224,32 +276,11 @@ export default async function handler(req) {
       return jsonError('DEEPSEEK_API_KEY not configured in environment variables', 500);
     }
 
-    // 构建系统提示词，注入行程上下文
+    // 构建系统提示词：行程数据来自请求体 tripContext（前端从 data/trips.json 载入后传入），
+    // 后端不再硬编码行程，改数据只需改 data/trips.json 这一个文件。
     const systemMessage = {
       role: 'system',
-      content: `你是L.L的专属AI行程管家，专门负责三亚40天海岛慢度假行程的问答与调整。
-
-【当前行程基本信息】
-- 行程名称：三亚40天·海岛慢度假
-- 时间：2026年12月28日 → 2027年2月5日，共40天
-- 出发地：上海虹桥机场，目的地：三亚凤凰机场
-- 往返航班：去程MU5375（12/28 虹桥16:10→凤凰19:30），返程MU5378（2/5 凤凰17:50→虹桥21:00，除夕落地）
-- 总预算：65万元
-- 住宿安排：七段换湾——天涯小镇8晚→三亚湾中段5晚→珊瑚湾文华东方5晚→亚龙湾4晚→太阳湾柏悦4晚→海棠湾5晚→清水湾5晚→三亚湾收尾3晚
-
-【你的能力】
-1. 回答关于行程的任何问题：第几天去哪、住什么酒店、吃什么餐厅、交通安排、预算构成等
-2. 给出调整建议：根据用户需求推荐餐厅、景点、时间安排的优化
-3. 风格友好、贴心、简洁，符合私人管家的定位
-4. 所有回答基于提供的行程数据，不要编造不存在的安排
-5. 如果用户提出修改需求，先给出修改预览方案，确认后再实际生效（当前阶段为只读问答，暂不直接修改数据）
-
-【注意事项】
-- 三亚冬季白天24-28℃，夜间19-22℃，紫外线强，提醒防晒
-- 行程以慢节奏、松弛感为主，不赶景点，每天只安排1-2个主要活动
-- 傍晚16:00后再出门活动，避开正午日晒
-- 酒店选择优先安静、私密度假体验
-- 当前为只读问答模式，修改行程的功能将在后续版本上线，你可以先给出修改建议供参考`,
+      content: buildSystemPrompt(tripContext),
     };
 
     // 合并消息：系统提示 + 历史消息
